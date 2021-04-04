@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"safetynet/internal/alert"
@@ -32,7 +31,7 @@ type addressLocation struct {
 }
 
 // find devices to alert when someone is in dange
-func FindDevicesToAlert(ctx context.Context, src *database.SafetynetDevice) (int, error) {
+func FindDevicesToAlert(ctx context.Context, src database.SafetynetDevice) (int, error) {
 	var wg sync.WaitGroup
 	var alertedDevices int
 
@@ -45,56 +44,38 @@ func FindDevicesToAlert(ctx context.Context, src *database.SafetynetDevice) (int
 	}
 	defer cursor.Close(ctx)
 
-	client, err := fcm.NewClient(keys.SERVER_KEY)
-	if err != nil {
-		if client = retyConnect(2*time.Second, 2); client == nil {
-			return 0, err
-		}
-	}
-
 	for cursor.Next(ctx) {
-
 		wg.Add(1)
-		go func(c mongo.Cursor) {
-			var device database.SafetynetDevice
-
-			if err := c.Decode(&device); err != nil || device.Id == src.Id {
-				return
-			}
-
-			pair := &coordPair{
-				LatSrc:  src.Lat,
-				LonSrc:  src.Lon,
-				LatRecv: device.Lat,
-				LonRecv: device.Lon,
-			}
-
-			// check if the receiver device is in range of the alert
-			if checkInDistance(pair) {
-
-				if err := alertDevice(&device, pair, client); err == nil {
-					alertedDevices++
-				}
-
-			}
-		}(*cursor)
+		go checkAndAlert(*cursor, &wg, src, &alertedDevices, alert.Client)
 	}
 	wg.Wait()
 	return alertedDevices, nil
 }
 
-func retyConnect(sleep time.Duration, attempts int) *fcm.Client {
-	for i := 0; i < attempts; i++ {
-		time.Sleep(sleep)
-		client, err := fcm.NewClient(keys.SERVER_KEY)
-		if err != nil {
-			return client
+func checkAndAlert(c mongo.Cursor, wg *sync.WaitGroup, src database.SafetynetDevice, alertedDevices *int, client *fcm.Client) {
+	defer wg.Done()
+	var device database.SafetynetDevice
+
+	if err := c.Decode(&device); err != nil || device.Id == src.Id {
+		return
+	}
+
+	pair := coordPair{
+		LatSrc:  src.Lat,
+		LonSrc:  src.Lon,
+		LatRecv: device.Lat,
+		LonRecv: device.Lon,
+	}
+
+	// check if the receiver device is in range of the alert
+	if checkInDistance(pair) {
+		if err := alertDevice(device, pair, client); err == nil {
+			*alertedDevices++
 		}
 	}
-	return nil
 }
 
-func alertDevice(device *database.SafetynetDevice, pair *coordPair, client *fcm.Client) error {
+func alertDevice(device database.SafetynetDevice, pair coordPair, client *fcm.Client) error {
 	address, err := getLocation(pair)
 	var msg string
 
@@ -108,7 +89,7 @@ func alertDevice(device *database.SafetynetDevice, pair *coordPair, client *fcm.
 
 		retry := func() error { return alert.PushNotif(device.Id, msg, client) }
 
-		err = helpers.Rety(retry, 1*time.Second, 2)
+		err = helpers.Retry(retry, 1*time.Second, 2)
 
 		if err != nil {
 			return err
@@ -118,7 +99,7 @@ func alertDevice(device *database.SafetynetDevice, pair *coordPair, client *fcm.
 	return nil
 }
 
-func getLocation(coords *coordPair) (*addressLocation, error) {
+func getLocation(coords coordPair) (*addressLocation, error) {
 	var address addressData
 	baseURL, err := url.Parse("http://api.positionstack.com")
 	if err != nil {
@@ -153,13 +134,9 @@ func getLocation(coords *coordPair) (*addressLocation, error) {
 		return nil, err
 	}
 
-	defer res.Body.Close()
-
-	body, err := ioutil.ReadAll(res.Body)
-	if err != nil {
+	if err = json.NewDecoder(res.Body).Decode(&address); err != nil {
 		return nil, err
 	}
 
-	json.Unmarshal(body, &address)
 	return &address.Data[0], nil
 }
